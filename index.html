@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>画像切り取りカメラ（v18.2 Rescue Build｜UI維持＋共有＋クリーンアップ）</title>
+<meta name="theme-color" content="#0b0f14" />
+<style>
+  :root{ --bg:#0b0f14; --fg:#eaf2f7; --muted:#a6b6c4; --accent:#2ecc71; --danger:#e74c3c; --ring:#27ae60; --card:#12181f; }
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family: system-ui,-apple-system,Segoe UI,Roboto,"Hiragino Kaku Gothic ProN","Yu Gothic",sans-serif;}
+  .app{display:flex;flex-direction:column;height:100%;}
+  .stage{position:relative;flex:1;overflow:hidden;background:#000;}
+  .stage>video,#photo-preview,.stage>canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}
+  .topbar{position:absolute;top:8px;left:8px;right:8px;display:flex;justify-content:space-between;align-items:center;z-index:25}
+  .title{font-weight:700;opacity:.9}
+  .icon-btn{border:1px solid rgba(255,255,255,.25);background:rgba(0,0,0,.45);color:#fff;padding:8px 10px;border-radius:999px}
+  .bottombar{position:absolute;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;background:rgba(0,0,0,.5);z-index:20}
+  .pill{border:1px solid rgba(255,255,255,.2);background:rgba(0,0,0,.4);color:#fff;border-radius:999px;padding:10px 14px;font-weight:700}
+  .btn-capture{width:84px;height:84px;border-radius:50%;background:#fff;border:6px solid #cfcfcf;}
+  .hidden{display:none}
+  .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:20px;background:rgba(0,0,0,.85);color:#fff;padding:10px 14px;border-radius:999px;font-size:14px;opacity:0;transition:opacity .2s ease;pointer-events:none;z-index:50}
+  .toast.show{opacity:1}
+  /* 設定シート */
+  .sheet{position:fixed;left:0;right:0;bottom:0;transform:translateY(100%);transition:transform .28s ease;z-index:30;background:var(--card);border-top-left-radius:16px;border-top-right-radius:16px;box-shadow:0 -8px 24px rgba(0,0,0,.45)}
+  .sheet.open{transform:translateY(0)}
+  .sheet .grab{width:42px;height:4px;background:#3a4654;border-radius:999px;margin:10px auto}
+  .sheet .section{padding:8px 16px 14px;border-top:1px solid rgba(255,255,255,.06)}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
+  .chip{border-radius:14px;border:1px solid rgba(255,255,255,.18);background:#19212c;color:#eaf2f7;font-weight:700;padding:10px 12px}
+  .chip[data-active="true"]{outline:2px solid var(--ring);background:rgba(46,204,113,.12)}
+  .toggle{border-radius:12px;border:1px solid rgba(255,255,255,.18);background:#19212c;color:#eaf2f7;padding:10px 12px}
+  .toggle[data-active="true"]{outline:2px solid var(--ring);background:rgba(46,204,113,.12)}
+  .toggle.warn[data-active="true"]{outline-color:#f1c40f}
+  .label{font-size:13px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="app">
+  <main class="stage" id="stage">
+    <video id="preview" autoplay muted playsinline></video>
+    <img id="photo-preview" alt="" class="hidden" />
+    <canvas id="overlay"></canvas>
+
+    <div class="topbar">
+      <div class="title">画像切り取りカメラ</div>
+      <button id="open-settings" class="icon-btn" aria-label="設定を開く">⚙</button>
+    </div>
+
+    <div class="bottombar">
+      <label id="pick-file" for="file-input" class="pill">📷 写真</label>
+      <button id="capture" class="btn-capture" aria-label="撮影"></button>
+      <div style="display:flex;gap:8px">
+        <button id="resume" class="pill" title="カメラを再開">再開</button>
+        <a id="dl" class="pill hidden" download>保存</a>
+        <button id="share" class="pill hidden">共有</button>
+      </div>
+    </div>
+  </main>
+</div>
+<input id="file-input" class="hidden" type="file" accept="image/*" capture="environment" />
+<div id="toast" class="toast" aria-live="polite"></div>
+
+<!-- 設定シート（元の構成） -->
+<section id="sheet" class="sheet" aria-hidden="true">
+  <div class="grab"></div>
+  <div class="section">
+    <div class="label">丸枠サイズ</div>
+    <div class="row" id="size-row">
+      <button class="chip" data-size="0.35" data-active="true">S</button>
+      <button class="chip" data-size="0.42">M</button>
+      <button class="chip" data-size="0.50">L</button>
+    </div>
+  </div>
+  <div class="section">
+    <div class="row">
+      <button id="grid" class="toggle" data-active="true">グリッド</button>
+      <button id="lock" class="toggle warn" data-active="false" title="ドラッグ無効">ロック</button>
+      <button id="recenter" class="toggle">中央に戻す</button>
+      <button id="fit-inside" class="toggle" data-active="true" title="丸枠を映像内に制限">枠のはみ出し防止</button>
+    </div>
+  </div>
+</section>
+
+<script>
+(function(){
+  // ーー 基本ユーティリティ ーー
+  const $=s=>document.querySelector(s);
+  const $$=s=>Array.from(document.querySelectorAll(s));
+  const clamp=(v,min,max)=>Math.max(min,Math.min(max,v));
+  const toast=$('#toast');
+  function showToast(msg,ms=2200){ toast.textContent=msg; toast.classList.add('show'); setTimeout(()=>toast.classList.remove('show'),ms); }
+
+  // ーー 要素参照 ーー
+  const stage=$('#stage');
+  const video=$('#preview');
+  const overlay=$('#overlay');
+  const ctx=overlay.getContext('2d');
+  const photoPreview=$('#photo-preview');
+  const captureBtn=$('#capture');
+  const dl=$('#dl');
+  const shareBtn=$('#share');
+  const resumeBtn=$('#resume');
+  const fileInput=$('#file-input');
+  const pickFile=$('#pick-file');
+  const openSettings=$('#open-settings');
+  const sheet=$('#sheet');
+  const sizeChips=$$('#size-row .chip');
+  const gridBtn=$('#grid');
+  const lockBtn=$('#lock');
+  const recenterBtn=$('#recenter');
+  const fitBtn=$('#fit-inside');
+
+  // ーー 状態 ーー
+  let usingPhoto=false, photoObjUrl=null, photoBitmap=null;
+  let currentStream=null, latestBlobUrl=null;
+  let cxNorm=0.5, cyNorm=0.5, radiusPct=0.35, showGrid=true, locked=false, fitInside=true;
+
+  // ーー カメラ起動（安定化） ーー
+  const isiOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform==='MacIntel' && navigator.maxTouchPoints>1);
+  const isHTTPS = location.protocol==='https:' || ['localhost','127.0.0.1','::1'].includes(location.hostname);
+
+  async function startCamera(){
+    stopCamera(); usingPhoto=false; updateStageVisual();
+    if(isiOS && !isHTTPS){ showToast('iPhone/Safariは https:// でアクセスしてください'); pickFile.classList.remove('hidden'); return; }
+    if(!navigator.mediaDevices?.getUserMedia){ showToast('この端末ではカメラAPIが使えません'); pickFile.classList.remove('hidden'); return; }
+    try{
+      video.setAttribute('playsinline',''); video.setAttribute('muted',''); video.playsInline=true; video.muted=true;
+      const constraints={ audio:false, video:{ facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1080}, frameRate:{ideal:30} } };
+      currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject=currentStream;
+      await new Promise(res=>{ if(video.readyState>=2) res(); else video.onloadedmetadata=()=>res(); });
+      await video.play().catch(()=>{});
+      // 黒画面時は5秒後に前面へフォールバック
+      setTimeout(async()=>{ if(!video.videoWidth){ try{ stopCamera(); const alt={audio:false, video:{facingMode:{ideal:'user'}, width:{ideal:1280}, height:{ideal:720}}}; currentStream=await navigator.mediaDevices.getUserMedia(alt); video.srcObject=currentStream; await video.play().catch(()=>{});}catch(_){}} }, 5000);
+    }catch(e){ console.warn('getUserMedia failed', e); showToast('カメラ起動に失敗：写真から読み込みに切替可能'); pickFile.classList.remove('hidden'); }
+  }
+  function stopCamera(){ if(currentStream){ currentStream.getTracks().forEach(t=>t.stop()); currentStream=null; } }
+
+  // ーー オーバーレイ描画（丸枠） ーー
+  function updateOverlaySize(){ overlay.width = stage.clientWidth; overlay.height = stage.clientHeight; }
+  function displayedDrawRect(){
+    const vw=video.videoWidth||1280, vh=video.videoHeight||720; const cw=stage.clientWidth, ch=stage.clientHeight;
+    const scale=Math.max(cw/vw, ch/vh); const drawW=vw*scale, drawH=vh*scale; const offsetX=(cw-drawW)/2, offsetY=(ch-drawH)/2;
+    return {vw,vh,scale,drawW,drawH,offsetX,offsetY};
+  }
+  function drawOverlay(){
+    updateOverlaySize(); const w=overlay.width, h=overlay.height; ctx.clearRect(0,0,w,h);
+    let r = Math.min(w,h) * radiusPct; let cx = cxNorm*w, cy = cyNorm*h;
+    if(fitInside){ const {drawW,drawH,offsetX,offsetY} = displayedDrawRect(); const minX=Math.max(r, offsetX + r), maxX=Math.min(w - r, offsetX + drawW - r); const minY=Math.max(r, offsetY + r), maxY=Math.min(h - r, offsetY + drawH - r); cx = clamp(cx, minX, maxX); cy = clamp(cy, minY, maxY); cxNorm = clamp(cx / w, 0, 1); cyNorm = clamp(cy / h, 0, 1); }
+    // マスク
+    ctx.save(); ctx.fillStyle='rgba(0,0,0,.6)'; ctx.fillRect(0,0,w,h); ctx.globalCompositeOperation='destination-out'; ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.fill(); ctx.restore();
+    // 枠
+    ctx.save(); ctx.strokeStyle = locked ? '#f1c40f' : '#00FF66'; ctx.lineWidth=4; ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.stroke();
+    if(showGrid){ ctx.strokeStyle='rgba(255,255,255,.95)'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(cx-r,cy); ctx.lineTo(cx+r,cy); ctx.moveTo(cx,cy-r); ctx.lineTo(cx,cy+r); const rr=r/Math.SQRT2; ctx.moveTo(cx-rr,cy-rr); ctx.lineTo(cx+rr,cy+rr); ctx.moveTo(cx-rr,cy+rr); ctx.lineTo(cx+rr,cy-rr); ctx.stroke(); }
+    ctx.restore();
+    requestAnimationFrame(drawOverlay);
+  }
+  requestAnimationFrame(drawOverlay);
+
+  // ーー 入力操作 ーー
+  overlay.addEventListener('pointerdown',e=>{ if(locked) return; overlay.setPointerCapture(e.pointerId); moveTo(e); });
+  overlay.addEventListener('pointermove',e=>{ if(locked) return; if(e.pressure>0) moveTo(e); });
+  overlay.addEventListener('pointerup',e=>{ if(locked) return; overlay.releasePointerCapture(e.pointerId); });
+  function moveTo(e){ const r=overlay.getBoundingClientRect(); const x=(e.clientX-r.left)/r.width; const y=(e.clientY-r.top)/r.height; cxNorm=clamp(x,0,1); cyNorm=clamp(y,0,1); }
+
+  // ーー 設定シート（元通り） ーー
+  function setActive(el,on){ if(!el) return; el.dataset.active = on? 'true':'false'; }
+  function isActive(el){ return el?.dataset?.active==='true'; }
+  sizeChips.forEach(btn=>btn.addEventListener('click',()=>{ sizeChips.forEach(b=>b.dataset.active='false'); btn.dataset.active='true'; radiusPct=parseFloat(btn.dataset.size||'0.35'); }));
+  gridBtn.addEventListener('click',()=>{ setActive(gridBtn,!isActive(gridBtn)); showGrid = isActive(gridBtn); });
+  lockBtn.addEventListener('click',()=>{ locked=!locked; setActive(lockBtn,locked); });
+  recenterBtn.addEventListener('click',()=>{ cxNorm=0.5; cyNorm=0.5; });
+  fitBtn.addEventListener('click',()=>{ setActive(fitBtn,!isActive(fitBtn)); fitInside=isActive(fitBtn); });
+
+  function openSheet(){ sheet.classList.add('open'); sheet.setAttribute('aria-hidden','false'); }
+  function closeSheet(){ sheet.classList.remove('open'); sheet.setAttribute('aria-hidden','true'); }
+  openSettings.addEventListener('click',()=>{ if(sheet.classList.contains('open')) closeSheet(); else openSheet(); });
+  sheet.addEventListener('click',(e)=>{ if(e.target===sheet) closeSheet(); });
+
+  // ーー 撮影＆出力（丸枠内のみ） ーー
+  captureBtn.addEventListener('click',async()=>{
+    try{ const src=usingPhoto?(photoBitmap||photoPreview):video; if(!src){ showToast('入力がありません'); return; } const url=await cropAndExport(src); presentOutput(url); }
+    catch(e){ console.warn(e); showToast('撮影に失敗しました'); }
+  });
+
+  async function cropAndExport(source){
+    const SAFETY_MARGIN_PCT = 0.02; // 2%の安全マージン
+    const OUTPUT_SIZE = 1080;      // SMS向け既定
+
+    const wSrc = source.videoWidth || source.width || source.naturalWidth || 1280;
+    const hSrc = source.videoHeight || source.height || source.naturalHeight || 720;
+    const cw = overlay.width, ch = overlay.height;
+    const rDisp = Math.min(cw, ch) * radiusPct * (1 - SAFETY_MARGIN_PCT);
+    const cxDisp = cxNorm * cw; const cyDisp = cyNorm * ch;
+    const scale = Math.max(cw / wSrc, ch / hSrc);
+    const drawW = wSrc * scale, drawH = hSrc * scale; const offX = (cw - drawW) / 2, offY = (ch - drawH) / 2;
+    const cxSrc = (cxDisp - offX) / scale; const cySrc = (cyDisp - offY) / scale; const rSrc = rDisp / scale;
+    const x1 = Math.max(0, Math.floor(cxSrc - rSrc)); const y1 = Math.max(0, Math.floor(cySrc - rSrc));
+    const x2 = Math.min(wSrc, Math.ceil(cxSrc + rSrc)); const y2 = Math.min(hSrc, Math.ceil(cySrc + rSrc));
+    const sw = x2 - x1, sh = y2 - y1; const side = Math.max(sw, sh);
+
+    const useOffscreen = (typeof OffscreenCanvas !== 'undefined');
+    const square = useOffscreen ? new OffscreenCanvas(side, side) : (function(){ const c=document.createElement('canvas'); c.width=side; c.height=side; return c; })();
+    const sctx = square.getContext('2d', {alpha:false});
+    sctx.fillStyle = '#000'; sctx.fillRect(0,0,side,side);
+    const dx = Math.floor((side - sw)/2), dy = Math.floor((side - sh)/2);
+    sctx.drawImage(source, x1, y1, sw, sh, dx, dy, sw, sh);
+    sctx.save(); sctx.globalCompositeOperation='destination-in'; sctx.beginPath(); sctx.arc(side/2, side/2, Math.min(sw, sh)/2, 0, Math.PI*2); sctx.fill(); sctx.restore();
+
+    const out = useOffscreen ? new OffscreenCanvas(OUTPUT_SIZE, OUTPUT_SIZE) : (function(){ const c=document.createElement('canvas'); c.width=OUTPUT_SIZE; c.height=OUTPUT_SIZE; return c; })();
+    const octx = out.getContext('2d', {alpha:false}); octx.imageSmoothingQuality='high'; octx.drawImage(square, 0, 0, OUTPUT_SIZE, OUTPUT_SIZE);
+
+    if(useOffscreen){ const blob = await out.convertToBlob({type:'image/jpeg', quality:0.85}); const url = URL.createObjectURL(blob); latestBlobUrl=url; return url; }
+    return await new Promise(res=>{ out.toBlob((blob)=>{ const url=URL.createObjectURL(blob); latestBlobUrl=url; res(url); }, 'image/jpeg', 0.85); });
+  }
+
+  function presentOutput(url){
+    const ts=new Date(); const pad=n=>String(n).padStart(2,'0');
+    const filename=`IMG_${ts.getFullYear()}${pad(ts.getMonth()+1)}${pad(ts.getDate())}_${pad(ts.getHours())}${pad(ts.getMinutes())}${pad(ts.getSeconds())}.jpg`;
+    dl.href=url; dl.download=filename; dl.classList.remove('hidden');
+    enableShare(url,filename);
+    // 対応端末は撮影直後に共有を開く
+    maybeShare(url,filename);
+  }
+
+  async function enableShare(url,filename){ try{ const resp=await fetch(url); const blob=await resp.blob(); const file=new File([blob],filename,{type:blob.type||'image/jpeg'}); if(navigator.canShare && navigator.canShare({files:[file]})){ shareBtn.classList.remove('hidden'); shareBtn.onclick=async()=>{ await doShare(file); }; } else { shareBtn.classList.add('hidden'); } }catch(_){ shareBtn.classList.add('hidden'); } }
+  async function maybeShare(url,filename){ try{ const resp=await fetch(url); const blob=await resp.blob(); const file=new File([blob],filename,{type:blob.type||'image/jpeg'}); if(navigator.canShare && navigator.canShare({files:[file]})){ await doShare(file); } }catch(e){ console.warn(e); } }
+  async function doShare(file){ try{ await navigator.share({files:[file], title:'画像'}); cleanupAfterOutput('共有しました'); }catch(e){ /* cancel */ } }
+  dl.addEventListener('click',()=>{ setTimeout(()=>cleanupAfterOutput('保存しました'), 800); });
+  function cleanupAfterOutput(msg){ if(latestBlobUrl){ try{ URL.revokeObjectURL(latestBlobUrl);}catch(_){} latestBlobUrl=null; } dl.classList.add('hidden'); shareBtn.classList.add('hidden'); showToast(msg); }
+
+  // ーー ファイル読込・再開 ーー
+  pickFile.addEventListener('click',()=>fileInput.click());
+  fileInput.addEventListener('change',async e=>{ const f=e.target.files?.[0]; if(!f) return; const img=new Image(); img.onload=()=>{ photoPreview.src=img.src; usingPhoto=true; stopCamera(); updateStageVisual(); }; img.src=URL.createObjectURL(f); photoObjUrl=img.src; if(window.createImageBitmap){ try{ photoBitmap=await createImageBitmap(f); }catch(_){ photoBitmap=null; } } });
+  function updateStageVisual(){ if(usingPhoto){ video.classList.add('hidden'); photoPreview.classList.remove('hidden'); } else { video.classList.remove('hidden'); photoPreview.classList.add('hidden'); } }
+  resumeBtn.addEventListener('click',()=>{ usingPhoto=false; if(photoObjUrl){ try{ URL.revokeObjectURL(photoObjUrl);}catch(_){} } photoObjUrl=null; photoBitmap=null; photoPreview.src=''; fileInput.value=''; startCamera(); updateStageVisual(); showToast('カメラを再開しました'); });
+
+  // ーー 初期化 ーー
+  startCamera();
+  video.addEventListener('click', ()=>{ if(video.paused){ video.play().catch(()=>{}); } });
+  // 起動時エラーを可視化
+  window.addEventListener('error', (e)=>{ showToast('起動時エラー: '+(e?.message||'不明'), 3200); });
+})();
+</script>
+</body>
+</html>
